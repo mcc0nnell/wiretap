@@ -14,6 +14,8 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
+	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
+	"gvisor.dev/gvisor/pkg/waiter"
 )
 
 // Implement Bind from wireguard/conn.
@@ -63,24 +65,39 @@ func (e UserspaceEndpoint) SrcToString() string {
 }
 
 func listenNet(tnet *netstack.Net, network string, port int) (*gonet.UDPConn, int, error) {
-	var ip netip.Addr
 	var pn tcpip.NetworkProtocolNumber
 	switch network {
 	case "udp4":
-		ip = netip.MustParseAddr("0.0.0.0")
 		pn = ipv4.ProtocolNumber
 	case "udp6":
-		ip = netip.MustParseAddr("::")
 		pn = ipv6.ProtocolNumber
 	default:
-		return nil, 0, errors.New("invalid network string")
+		return nil, port, errors.New("invalid network string")
 	}
 
-	addr := netip.AddrPortFrom(ip, uint16(port))
-	conn, err := gonet.DialUDP(tnet.Stack(), &tcpip.FullAddress{NIC: 1, Addr: tcpip.AddrFromSlice([]byte{}), Port: addr.Port()}, nil, pn)
-	if err != nil {
-		return nil, 0, err
+	var wq waiter.Queue
+	ep, terr := tnet.Stack().NewEndpoint(udp.ProtocolNumber, pn, &wq)
+	if terr != nil {
+		return nil, port, errors.New(terr.String())
 	}
+
+	// Match Go's net.ListenPacket("udp6", ...) / WireGuard StdNetBind:
+	// an IPv6 wildcard bind is dual-stack in gVisor unless V6Only is set,
+	// which would also reserve the IPv4 port.
+	if pn == ipv6.ProtocolNumber {
+		ep.SocketOptions().SetV6Only(true)
+	}
+
+	if terr := ep.Bind(tcpip.FullAddress{NIC: 1, Port: uint16(port)}); terr != nil {
+		ep.Close()
+		return nil, port, &net.OpError{
+			Op:  "bind",
+			Net: network,
+			Err: errors.New(terr.String()),
+		}
+	}
+
+	conn := gonet.NewUDPConn(&wq, ep)
 
 	// Retrieve port.
 	laddr := conn.LocalAddr()
@@ -89,7 +106,8 @@ func listenNet(tnet *netstack.Net, network string, port int) (*gonet.UDPConn, in
 		laddr.String(),
 	)
 	if err != nil {
-		return nil, 0, err
+		_ = conn.Close()
+		return nil, port, err
 	}
 	return conn, uaddr.Port, nil
 }
@@ -104,11 +122,20 @@ func (bind *UserspaceSocketBind) Open(uport uint16) ([]conn.ReceiveFunc, uint16,
 		return nil, 0, conn.ErrBindAlreadyOpen
 	}
 
+	// Attempt to open ipv4 and ipv6 listeners on the same port.
 	port := int(uport)
 	var ipv4, ipv6 *gonet.UDPConn
 
-	ipv4, port, err = listenNet(bind.tnet, "udp6", port)
+	ipv4, port, err = listenNet(bind.tnet, "udp4", port)
 	if err != nil && !errors.Is(err, syscall.EAFNOSUPPORT) {
+		return nil, 0, err
+	}
+
+	ipv6, port, err = listenNet(bind.tnet, "udp6", port)
+	if err != nil && !errors.Is(err, syscall.EAFNOSUPPORT) {
+		if ipv4 != nil {
+			_ = ipv4.Close()
+		}
 		return nil, 0, err
 	}
 
@@ -117,8 +144,8 @@ func (bind *UserspaceSocketBind) Open(uport uint16) ([]conn.ReceiveFunc, uint16,
 		fns = append(fns, bind.makeReceive(ipv4))
 		bind.ipv4 = ipv4
 	}
-	if ipv4 != nil {
-		fns = append(fns, bind.makeReceive(ipv4))
+	if ipv6 != nil {
+		fns = append(fns, bind.makeReceive(ipv6))
 		bind.ipv6 = ipv6
 	}
 	if len(fns) == 0 {
@@ -139,6 +166,10 @@ func (bind *UserspaceSocketBind) Close() error {
 	if bind.ipv4 != nil {
 		err1 = bind.ipv4.Close()
 		bind.ipv4 = nil
+	}
+	if bind.ipv6 != nil {
+		err2 = bind.ipv6.Close()
+		bind.ipv6 = nil
 	}
 	bind.blackhole4 = false
 	bind.blackhole6 = false
@@ -178,6 +209,7 @@ func (bind *UserspaceSocketBind) Send(buff [][]byte, endpoint conn.Endpoint) err
 	conn := bind.ipv4
 	if addrPort.Addr().Is6() {
 		blackhole = bind.blackhole6
+		conn = bind.ipv6
 	}
 	bind.mu.Unlock()
 
